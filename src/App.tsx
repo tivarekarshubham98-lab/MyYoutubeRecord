@@ -1,18 +1,108 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { FormEvent } from 'react'
 import { Download, ExternalLink, Eye, Heart, MessageCircle, Play, RefreshCw, Search, Video as VideoIcon, Youtube } from 'lucide-react'
+import FirstLaunchSetup from './FirstLaunchSetup'
 import type { DashboardData, Video } from './types'
 
 const number = new Intl.NumberFormat('en-US')
 const date = (value: string) => new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(value))
 const time = (value: string) => new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' }).format(new Date(value))
 
-function App() {
+type SetupStatus = { configured: boolean; loggedOut?: boolean; channelName?: string; verifiedEmail?: string; issue?: string; requiresPasswordForReset?: boolean }
+
+export default function App() {
+  const [setup, setSetup] = useState<SetupStatus | null>(null)
+  const [setupError, setSetupError] = useState('')
+
+  const loadSetup = useCallback(async () => {
+    setSetupError('')
+    try {
+      const response = await fetch('/api/setup/status', { cache: 'no-store' })
+      if (!response.ok) throw new Error('The local setup service is unavailable.')
+      setSetup(await response.json() as SetupStatus)
+    } catch (reason) {
+      setSetupError(reason instanceof Error ? reason.message : 'The local setup service is unavailable.')
+    }
+  }, [])
+
+  useEffect(() => { void loadSetup() }, [loadSetup])
+
+  if (!setup) return <main className="first-setup-page"><div className="first-setup-brand"><span className="brand-mark"><Youtube size={17} fill="currentColor" /></span><span>MyYoutubeRecord</span></div><section className="first-setup-card setup-status-card"><div className="setup-eyebrow">MY YOUTUBE RECORD</div><h1>{setupError ? 'Can’t connect yet' : 'Starting your workspace'}</h1><p className="setup-intro">{setupError || 'Checking your one-time setup status…'}</p>{setupError && <button className="setup-save-button" onClick={() => void loadSetup()}>Try again</button>}</section></main>
+  if (!setup.configured) return <FirstLaunchSetup mode={setup.loggedOut ? 'login' : 'setup'} initialNotice={setup.issue} onComplete={(channelName, verifiedEmail) => setSetup((previous) => ({ ...previous, configured: true, loggedOut: false, channelName, verifiedEmail }))} />
+  return <Dashboard requiresPasswordForReset={setup.requiresPasswordForReset !== false} onLogout={() => setSetup((previous) => previous ? { ...previous, configured: false, loggedOut: true } : previous)} onReset={() => setSetup({ configured: false })} />
+}
+
+function Dashboard({ onReset, onLogout, requiresPasswordForReset }: { onReset: () => void; onLogout: () => void; requiresPasswordForReset: boolean }) {
   const [data, setData] = useState<DashboardData | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [error, setError] = useState('')
   const [query, setQuery] = useState('')
+  const [showResetDialog, setShowResetDialog] = useState(false)
+  const [resetPassword, setResetPassword] = useState('')
+  const [resetConfirmation, setResetConfirmation] = useState('')
+  const [resetError, setResetError] = useState('')
+  const [resetting, setResetting] = useState(false)
+  const [loggingOut, setLoggingOut] = useState(false)
+  const [logoutError, setLogoutError] = useState('')
+  const [resetGoogleVerified, setResetGoogleVerified] = useState(false)
+  const [resetGoogleBusy, setResetGoogleBusy] = useState(false)
+
+  const connectGoogleForReset = async () => {
+    setResetError('')
+    setResetGoogleBusy(true)
+    try {
+      const response = await fetch('/api/setup/google/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ purpose: 'reset' }) })
+      const result = await response.json() as { authorizationUrl?: string; error?: string }
+      if (!response.ok || !result.authorizationUrl) throw new Error(result.error || 'Google sign-in could not be started.')
+      window.open(result.authorizationUrl, '_blank', 'noopener,noreferrer')
+      const deadline = Date.now() + 10 * 60_000
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1200))
+        const statusResponse = await fetch('/api/setup/google/status', { cache: 'no-store' })
+        const state = await statusResponse.json() as { status: string; error?: string }
+        if (state.status === 'verified') { setResetGoogleVerified(true); return }
+        if (state.status === 'error') throw new Error(state.error || 'Google verification failed.')
+      }
+      throw new Error('Google verification timed out. Please try again.')
+    } catch (reason) {
+      setResetError(reason instanceof Error ? reason.message : 'Google verification failed.')
+    } finally { setResetGoogleBusy(false) }
+  }
+
+  const logout = async () => {
+    setLogoutError('')
+    setLoggingOut(true)
+    try {
+      const response = await fetch('/api/setup/logout', { method: 'POST' })
+      const result = await response.json() as { error?: string }
+      if (!response.ok) throw new Error(result.error || 'Logout could not be completed.')
+      onLogout()
+    } catch (reason) {
+      setLogoutError(reason instanceof Error ? reason.message : 'Logout could not be completed. Please try again.')
+    } finally { setLoggingOut(false) }
+  }
+
+  const resetSetup = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setResetError('')
+    setResetting(true)
+    try {
+      const response = await fetch('/api/setup/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...(requiresPasswordForReset ? { password: resetPassword } : {}), confirmation: resetConfirmation }),
+      })
+      const result = await response.json() as { error?: string }
+      if (!response.ok) throw new Error(result.error || 'The saved setup could not be reset.')
+      onReset()
+    } catch (reason) {
+      setResetError(reason instanceof Error ? reason.message : 'The saved setup could not be reset.')
+    } finally {
+      setResetting(false)
+    }
+  }
 
   const load = useCallback(async (refresh = false) => {
     refresh ? setRefreshing(true) : setLoading(true)
@@ -82,7 +172,8 @@ function App() {
   ]
 
   return <main className="app-shell">
-    <header className="topbar"><a className="brand" href="#"><span className="brand-mark"><Youtube size={20} fill="currentColor" /></span><span>studio<span className="brand-dot">.</span></span></a><span className="topbar-label">CHANNEL OVERVIEW</span><div className="topbar-right"><span className="live-dot" /> LIVE DATA</div></header>
+    <header className="topbar"><a className="brand" href="#"><span className="brand-mark"><Youtube size={20} fill="currentColor" /></span><span>studio<span className="brand-dot">.</span></span></a><span className="topbar-label">CHANNEL OVERVIEW</span><div className="topbar-right"><span className="live-dot" /> LIVE DATA <button className="channel-reset-button" onClick={() => { setResetError(''); setResetPassword(''); setResetConfirmation(''); setResetGoogleVerified(false); setShowResetDialog(true) }}>Change channel</button><button className="logout-button" onClick={() => void logout()} disabled={loggingOut}>{loggingOut ? 'Logging out…' : 'Logout'}</button></div></header>
+    {logoutError && <div className="inline-error">{logoutError}</div>}
     <section className="page-content">
       <div className="page-heading"><div><div className="eyebrow">YOUR CHANNEL <span> / </span> OVERVIEW</div><h1>Analytics at a glance<span className="title-period">.</span></h1><p className="subtitle">Everything happening on your channel, all in one place.</p></div><div className="heading-actions"><button className="button button-secondary" onClick={() => void exportExcel()} disabled={!data || exporting || loading}><Download size={16} strokeWidth={2} />{exporting ? 'Preparing…' : 'Export Excel'}</button><button className={`button button-dark ${refreshing ? 'is-refreshing' : ''}`} onClick={() => void load(true)} disabled={refreshing || loading}><RefreshCw size={15} className={refreshing ? 'spin' : ''} />{refreshing ? 'Refreshing' : 'Refresh data'}</button></div></div>
 
@@ -99,11 +190,10 @@ function App() {
       </> : null}
       <footer className="footer"><span>MADE FOR CREATORS</span><span>YOUTUBE DATA API <i /> LIVE SYNC</span></footer>
     </section>
+    {showResetDialog && <div className="reset-overlay"><section className="reset-dialog" role="dialog" aria-modal="true" aria-labelledby="reset-title"><div className="setup-eyebrow">CONFIRM CHANNEL RESET</div><h2 id="reset-title">Change saved channel</h2><p>This removes only the saved channel setup for this Windows profile. Your API key, exports, and other files stay in place. Google verification will be required again.</p><form onSubmit={(event) => void resetSetup(event)}>{requiresPasswordForReset ? <label className="setup-field"><span>Setup password</span><input type="password" autoComplete="current-password" required value={resetPassword} onChange={(event) => setResetPassword(event.target.value)} /></label> : <button type="button" className="google-connect-button" onClick={() => void connectGoogleForReset()} disabled={resetGoogleBusy || resetGoogleVerified}>{resetGoogleVerified ? 'Google account verified' : resetGoogleBusy ? 'Waiting for Google verification…' : 'Verify Google account to reset'}</button>}<label className="setup-field"><span>Type RESET to confirm</span><input autoComplete="off" required value={resetConfirmation} onChange={(event) => setResetConfirmation(event.target.value)} /></label>{resetError && <div className="setup-error" role="alert">{resetError}</div>}<div className="reset-actions"><button type="button" className="button button-secondary" onClick={() => setShowResetDialog(false)} disabled={resetting}>Cancel</button><button type="submit" className="button button-dark" disabled={resetting || resetConfirmation !== 'RESET' || (!requiresPasswordForReset && !resetGoogleVerified)}>{resetting ? 'Resetting…' : 'Reset setup'}</button></div></form></section></div>}
   </main>
 }
 
 function VideoRow({ video }: { video: Video }) {
   return <tr><td className="video-cell"><a className="video-thumb" href={video.url} target="_blank" rel="noreferrer">{video.thumbnail ? <img src={video.thumbnail} alt="" loading="lazy" /> : <span><Play size={15} fill="currentColor" /></span>}<span className="thumb-play"><Play size={12} fill="currentColor" /></span></a><a className="video-title" href={video.url} target="_blank" rel="noreferrer" title={video.title}>{video.title}</a></td><td className="date-cell">{date(video.publishedAt)}</td><td className="number-cell">{video.views === null ? <span className="na">N/A</span> : number.format(video.views)}</td><td className="number-cell">{video.likes === null ? <span className="na">N/A</span> : number.format(video.likes)}</td><td className="number-cell">{video.comments === null ? <span className="na">N/A</span> : number.format(video.comments)}</td><td><span className={`visibility ${video.visibility.toLowerCase()}`}><i />{video.visibility}</span></td><td className="duration-cell">{video.duration ?? 'N/A'}</td><td className="updated-cell">{date(video.lastUpdated)} · {time(video.lastUpdated)}</td></tr>
 }
-
-export default App

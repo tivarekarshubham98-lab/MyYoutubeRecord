@@ -1,13 +1,20 @@
 {
   "name": "youtube-channel-analytics",
-  "version": "1.0.0",
+  "productName": "MyYoutubeRecord",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
     "dev:client": "vite",
     "dev:server": "tsx server/index.ts",
-    "build": "tsc -b && vite build",
+    "electron:dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\" \"npm:electron:launch\"",
+    "electron:dev:fresh": "node electron/dev-fresh.cjs",
+    "electron:launch": "wait-on http://localhost:3001/api/health http://localhost:5173 && node electron/launch.cjs",
+    "build": "tsc -b && vite build && npm run build:backend",
+    "build:backend": "esbuild server/index.ts --bundle --platform=node --format=cjs --target=node22 --outfile=backend-dist/server.cjs",
+    "dist:win": "npm run build && electron-builder --win nsis",
     "start": "tsx server/index.ts"
   },
   "dependencies": {
@@ -25,10 +32,48 @@
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
-    "concurrently": "^9.1.2",
+    "concurrently": "^9.2.5",
+    "esbuild": "^0.28.2",
+    "electron": "^45.1.0",
+    "electron-builder": "^26.18.0",
     "tailwindcss": "^4.0.0",
     "tsx": "^4.19.2",
     "typescript": "~5.7.2",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "wait-on": "^9.5.1"
+  },
+  "build": {
+    "appId": "com.myyoutuberecord.desktop",
+    "productName": "MyYoutubeRecord",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/main.cjs",
+      "dist/**/*",
+      "package.json",
+      "!node_modules/**",
+      "!server/**",
+      "!src/**",
+      "!vite.config.ts",
+      "!tsconfig*.json",
+      "!README.md",
+      "!.env*"
+    ],
+    "extraResources": [
+      { "from": "backend-dist/server.cjs", "to": "backend/server.cjs" }
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "MyYoutubeRecord Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createStartMenuShortcut": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "MyYoutubeRecord"
+    }
   }
 }

@@ -1,16 +1,411 @@
 import 'dotenv/config'
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
 import express from 'express'
+import fs from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 
 const app = express()
 const port = Number(process.env.PORT || 3001)
+const host = process.env.HOST || '127.0.0.1'
 const apiKey = process.env.YOUTUBE_API_KEY
-const channelId = process.env.YOUTUBE_CHANNEL_ID || 'UCdeGyg9ocj-F7Q-r_owLtBg'
+const defaultChannelId = process.env.YOUTUBE_CHANNEL_ID || ''
 const apiBase = 'https://www.googleapis.com/youtube/v3'
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const oauthClientId = process.env.GOOGLE_OAUTH_CLIENT_ID
+const oauthClientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET
+const scrypt = promisify(scryptCallback)
+const appDataDir = process.env.APP_CONFIG_DIR || (process.platform === 'win32'
+  ? path.join(process.env.APPDATA || os.homedir(), 'MyYoutubeRecord')
+  : path.join(os.homedir(), '.config', 'MyYoutubeRecord'))
+const setupFile = path.join(appDataDir, 'setup.json')
+const logoutFile = path.join(appDataDir, 'logout.json')
+let invalidSavedSetup = false
+
+type SetupConfig = {
+  completed: true
+  channelId: string
+  channelName: string
+  channelUrl: string
+  channelThumbnail?: string | null
+  verifiedEmail: string
+  googleSubject: string
+  passwordSalt?: string
+  passwordHash?: string
+  createdAt: string
+}
+type OAuthAttempt = {
+  state: string
+  verifier: string
+  redirectUri: string
+  expiresAt: number
+  purpose: 'setup' | 'reset' | 'login'
+}
+type AccessibleChannel = { id: string; name: string; thumbnail: string | null }
+type VerifiedSetup = {
+  channels: AccessibleChannel[]
+  email: string
+  subject: string
+  expiresAt: number
+}
+
+async function readSetup(): Promise<SetupConfig | null> {
+  let raw: string
+  try {
+    raw = await fs.readFile(setupFile, 'utf8')
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return null
+    invalidSavedSetup = true
+    return null
+  }
+
+  try {
+    const value = JSON.parse(raw) as Partial<SetupConfig>
+    const channelIdIsValid = typeof value.channelId === 'string' && /^UC[A-Za-z0-9_-]{20,30}$/.test(value.channelId)
+    const channelUrlIsValid = typeof value.channelUrl === 'string' && value.channelUrl.length <= 500 && (() => {
+      try { return ['youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(new URL(value.channelUrl!).hostname.toLowerCase()) }
+      catch { return false }
+    })()
+    const hasPassword = value.passwordSalt !== undefined || value.passwordHash !== undefined
+    const passwordIsValid = hasPassword
+      ? typeof value.passwordSalt === 'string' && Buffer.from(value.passwordSalt, 'base64url').length === 16
+        && typeof value.passwordHash === 'string' && Buffer.from(value.passwordHash, 'base64').length === 64
+      : true
+    const isValid = value.completed === true
+      && channelIdIsValid
+      && typeof value.channelName === 'string' && value.channelName.trim().length > 0
+      && channelUrlIsValid
+      && typeof value.verifiedEmail === 'string' && value.verifiedEmail.includes('@')
+      && typeof value.googleSubject === 'string' && value.googleSubject.length > 0
+      && passwordIsValid
+      && typeof value.createdAt === 'string' && !Number.isNaN(Date.parse(value.createdAt))
+    if (isValid) return value as SetupConfig
+  } catch {
+    // Preserve malformed setup data and show setup instead of accepting it as complete.
+  }
+  invalidSavedSetup = true
+  return null
+}
+
+async function readLogoutState(): Promise<boolean> {
+  try {
+    await fs.access(logoutFile)
+    return true
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return false
+    return true
+  }
+}
+
+let setupConfig: SetupConfig | null = null
+let channelId = defaultChannelId
+let oauthAttempt: OAuthAttempt | null = null
+let verifiedSetup: VerifiedSetup | null = null
+let verifiedPurpose: OAuthAttempt['purpose'] | null = null
+let setupError = ''
+let setupBusy = false
+let loggedOut = false
+let server: ReturnType<typeof app.listen> | undefined
 
 app.use(express.json())
+
+function setupErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Setup could not be completed. Please try again.'
+}
+
+function isValidState(actual: string, expected: string): boolean {
+  const actualBytes = Buffer.from(actual)
+  const expectedBytes = Buffer.from(expected)
+  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes)
+}
+
+app.get('/api/setup/status', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
+  res.json({
+    configured: Boolean(setupConfig?.completed && !loggedOut),
+    loggedOut,
+    channelName: setupConfig?.channelName,
+    verifiedEmail: setupConfig?.verifiedEmail,
+    requiresPasswordForReset: Boolean(setupConfig?.passwordHash),
+    issue: invalidSavedSetup ? 'An existing setup.json is invalid and was preserved. Back it up before configuring this profile again.' : undefined,
+  })
+})
+
+app.post('/api/setup/google/start', async (req, res) => {
+  const purpose = req.body?.purpose === 'reset' ? 'reset' : req.body?.purpose === 'login' ? 'login' : 'setup'
+  if (purpose === 'setup' && setupConfig?.completed) return res.status(409).json({ error: 'This user profile is already configured.' })
+  if (purpose === 'reset' && !setupConfig?.completed) return res.status(409).json({ error: 'This user profile is not configured.' })
+  if (purpose === 'login' && (!setupConfig?.completed || !loggedOut)) return res.status(409).json({ error: 'Log out from the dashboard before signing in again.' })
+  if (invalidSavedSetup) return res.status(409).json({ error: 'An existing setup.json is invalid and was preserved. Back it up before configuring this profile again.' })
+  if (!oauthClientId) return res.status(503).json({ error: 'Google OAuth is not configured. Add GOOGLE_OAUTH_CLIENT_ID for a Google Desktop OAuth client to your app .env file.' })
+  try {
+    const address = server?.address()
+    if (!address || typeof address === 'string') throw new Error('The local callback server is not ready.')
+    const redirectUri = `http://127.0.0.1:${address.port}`
+    const state = randomBytes(32).toString('base64url')
+    const verifier = randomBytes(32).toString('base64url')
+    const challenge = createHash('sha256').update(verifier).digest('base64url')
+    oauthAttempt = { state, verifier, redirectUri, expiresAt: Date.now() + 10 * 60_000, purpose }
+    verifiedSetup = null
+    verifiedPurpose = null
+    setupError = ''
+    const authorizationUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth')
+    authorizationUrl.search = new URLSearchParams({
+      client_id: oauthClientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: 'openid email profile https://www.googleapis.com/auth/youtube.readonly',
+      state,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      access_type: 'online',
+      prompt: 'select_account',
+    }).toString()
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ authorizationUrl: authorizationUrl.toString() })
+  } catch (error) {
+    res.status(400).json({ error: setupErrorMessage(error) })
+  }
+})
+
+app.get('/api/setup/google/status', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
+  if (verifiedSetup && verifiedSetup.expiresAt > Date.now()) {
+    return res.json({ status: 'verified', email: verifiedSetup.email, channels: verifiedSetup.channels })
+  }
+  if (verifiedSetup && verifiedSetup.expiresAt <= Date.now()) verifiedSetup = null
+  if (setupError) return res.json({ status: 'error', error: setupError })
+  if (oauthAttempt && oauthAttempt.expiresAt <= Date.now()) {
+    oauthAttempt = null
+    setupError = 'Google verification timed out. Please connect your account again.'
+    return res.json({ status: 'error', error: setupError })
+  }
+  res.json({ status: oauthAttempt ? 'pending' : 'idle' })
+})
+
+app.get('/', async (req, res, next) => {
+  if (typeof req.query.state !== 'string' && typeof req.query.code !== 'string' && typeof req.query.error !== 'string') return next()
+  const attempt = oauthAttempt
+  const state = typeof req.query.state === 'string' ? req.query.state : ''
+  const code = typeof req.query.code === 'string' ? req.query.code : ''
+
+  const finishPage = (message: string) => res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>MyYoutubeRecord setup</title></head><body style="font:16px system-ui;max-width:600px;margin:12vh auto;padding:24px;color:#252b2a"><h1>${message}</h1><p>Return to MyYoutubeRecord to continue setup.</p></body></html>`)
+  if (!attempt) return finishPage('Verification was not accepted')
+  if (attempt.expiresAt <= Date.now()) {
+    oauthAttempt = null
+    setupError = 'Google verification timed out. Please connect your account again.'
+    return finishPage('Verification was not accepted')
+  }
+  if (!isValidState(state, attempt.state)) {
+    setupError = 'Google verification could not be matched to this setup. Please connect your account again.'
+    return finishPage('Verification was not accepted')
+  }
+  oauthAttempt = null
+  verifiedPurpose = null
+  if (typeof req.query.error === 'string' || !code) {
+    const googleError = typeof req.query.error === 'string' ? req.query.error : ''
+    setupError = googleError === 'access_denied'
+      ? 'Google blocked this account because the OAuth app is in Testing mode. Add this email under Google Cloud Console → Google Auth Platform → Audience → Test users, or publish and complete verification for the app to allow other accounts.'
+      : 'Google account connection was cancelled or denied.'
+    return finishPage('Google account was not connected')
+  }
+
+  try {
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: oauthClientId!,
+        ...(oauthClientSecret ? { client_secret: oauthClientSecret } : {}),
+        code,
+        code_verifier: attempt.verifier,
+        grant_type: 'authorization_code',
+        redirect_uri: attempt.redirectUri,
+      }),
+    })
+    const tokenBody = await tokenResponse.json() as { access_token?: string; error_description?: string }
+    if (!tokenResponse.ok || !tokenBody.access_token) throw new Error(tokenBody.error_description || 'Google did not return an access token.')
+
+    const identityResponse = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { Authorization: `Bearer ${tokenBody.access_token}` },
+    })
+    const identity = await identityResponse.json() as { email?: string; email_verified?: boolean; sub?: string }
+    if (!identityResponse.ok || !identity.email || identity.email_verified !== true || !identity.sub) {
+      throw new Error('Google did not provide a verified email address for this account.')
+    }
+
+    const channels: Array<{ id: string; snippet?: { title?: string; thumbnails?: Record<string, { url?: string }> } }> = []
+    let pageToken = ''
+    do {
+      const query = new URLSearchParams({ part: 'id,snippet', mine: 'true', maxResults: '50', ...(pageToken ? { pageToken } : {}) })
+      const channelsResponse = await fetch(`${apiBase}/channels?${query}`, {
+        headers: { Authorization: `Bearer ${tokenBody.access_token}` },
+      })
+      const channelBody = await channelsResponse.json() as {
+        items?: Array<{ id: string; snippet?: { title?: string; thumbnails?: Record<string, { url?: string }> } }>
+        nextPageToken?: string
+        error?: { message?: string }
+      }
+      if (!channelsResponse.ok) throw new Error(channelBody.error?.message || 'YouTube could not verify channels for this Google account.')
+      channels.push(...(channelBody.items || []))
+      pageToken = channelBody.nextPageToken || ''
+    } while (pageToken)
+
+    const accessibleChannels: AccessibleChannel[] = channels.map((channel) => ({
+      id: channel.id,
+      name: channel.snippet?.title?.trim() || 'YouTube channel',
+      thumbnail: channel.snippet?.thumbnails?.high?.url || channel.snippet?.thumbnails?.medium?.url || channel.snippet?.thumbnails?.default?.url || null,
+    }))
+    if (accessibleChannels.length === 0) throw new Error('No accessible YouTube channels were found for this Google account.')
+    verifiedSetup = {
+      channels: accessibleChannels,
+      email: identity.email,
+      subject: identity.sub,
+      expiresAt: Date.now() + 10 * 60_000,
+    }
+    verifiedPurpose = attempt.purpose
+    setupError = ''
+    // The OAuth token is intentionally kept only in this callback scope and is never persisted or sent to the renderer.
+    delete tokenBody.access_token
+    return finishPage('Google account verified')
+  } catch (error) {
+    verifiedSetup = null
+    verifiedPurpose = null
+    setupError = setupErrorMessage(error)
+    return finishPage('Google account could not be verified')
+  }
+})
+
+app.post('/api/setup/complete', async (req, res) => {
+  if (setupConfig?.completed) return res.status(409).json({ error: 'This user profile is already configured.' })
+  if (invalidSavedSetup) return res.status(409).json({ error: 'An existing setup.json is invalid and was preserved. Back it up before configuring this profile again.' })
+  if (!verifiedSetup || verifiedSetup.expiresAt <= Date.now() || verifiedPurpose !== 'setup') return res.status(403).json({ error: 'Connect and verify your Google account before saving setup.' })
+  const selectedChannelId = typeof req.body?.channelId === 'string' ? req.body.channelId : ''
+  const selectedChannel = verifiedSetup.channels.find((channel) => channel.id === selectedChannelId)
+  if (!selectedChannel) return res.status(400).json({ error: 'Select a channel returned for the connected Google account.' })
+  if (setupBusy) return res.status(409).json({ error: 'Setup is already being saved.' })
+
+  setupBusy = true
+  try {
+    const config: SetupConfig = {
+      completed: true,
+      channelId: selectedChannel.id,
+      channelName: selectedChannel.name,
+      channelUrl: `https://www.youtube.com/channel/${selectedChannel.id}`,
+      channelThumbnail: selectedChannel.thumbnail,
+      verifiedEmail: verifiedSetup.email,
+      googleSubject: verifiedSetup.subject,
+      createdAt: new Date().toISOString(),
+    }
+    await fs.mkdir(appDataDir, { recursive: true })
+    const tempFile = `${setupFile}.${randomBytes(6).toString('hex')}.tmp`
+    await fs.writeFile(tempFile, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    await fs.rename(tempFile, setupFile)
+    setupConfig = config
+    loggedOut = false
+    invalidSavedSetup = false
+    channelId = config.channelId
+    verifiedSetup = null
+    verifiedPurpose = null
+    oauthAttempt = null
+    res.json({ ok: true, channelName: config.channelName })
+  } catch (error) {
+    res.status(500).json({ error: setupErrorMessage(error) })
+  } finally {
+    setupBusy = false
+  }
+})
+
+app.post('/api/setup/logout', (_req, res) => {
+  if (!setupConfig?.completed) return res.status(409).json({ error: 'This user profile is not configured.' })
+  void fs.mkdir(appDataDir, { recursive: true }).then(() => fs.writeFile(logoutFile, JSON.stringify({ loggedOut: true }), { encoding: 'utf8', mode: 0o600 })).then(() => {
+    loggedOut = true
+    oauthAttempt = null
+    verifiedSetup = null
+    verifiedPurpose = null
+    setupError = ''
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ ok: true })
+  }).catch((error) => res.status(500).json({ error: setupErrorMessage(error) }))
+})
+
+app.post('/api/setup/login', async (req, res) => {
+  if (!setupConfig?.completed || !loggedOut) return res.status(409).json({ error: 'This profile is not waiting for Google sign-in.' })
+  if (invalidSavedSetup) return res.status(409).json({ error: 'The saved setup is invalid and was preserved.' })
+  if (!verifiedSetup || verifiedSetup.expiresAt <= Date.now() || verifiedPurpose !== 'login') return res.status(403).json({ error: 'Connect and verify your Google account before continuing.' })
+  const selectedChannelId = typeof req.body?.channelId === 'string' ? req.body.channelId : ''
+  const selectedChannel = verifiedSetup.channels.find((channel) => channel.id === selectedChannelId)
+  if (!selectedChannel) return res.status(400).json({ error: 'Select a channel returned for the connected Google account.' })
+  if (setupBusy) return res.status(409).json({ error: 'Sign-in is already being saved.' })
+
+  setupBusy = true
+  try {
+    const config: SetupConfig = {
+      ...setupConfig,
+      channelId: selectedChannel.id,
+      channelName: selectedChannel.name,
+      channelUrl: `https://www.youtube.com/channel/${selectedChannel.id}`,
+      channelThumbnail: selectedChannel.thumbnail,
+      verifiedEmail: verifiedSetup.email,
+      googleSubject: verifiedSetup.subject,
+    }
+    const tempFile = `${setupFile}.${randomBytes(6).toString('hex')}.tmp`
+    await fs.writeFile(tempFile, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    await fs.rename(tempFile, setupFile)
+    await fs.unlink(logoutFile).catch((error) => {
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error
+    })
+    setupConfig = config
+    channelId = config.channelId
+    loggedOut = false
+    verifiedSetup = null
+    verifiedPurpose = null
+    oauthAttempt = null
+    setupError = ''
+    res.json({ ok: true, channelName: config.channelName, verifiedEmail: config.verifiedEmail })
+  } catch (error) {
+    res.status(500).json({ error: setupErrorMessage(error) })
+  } finally {
+    setupBusy = false
+  }
+})
+
+app.post('/api/setup/reset', async (req, res) => {
+  if (!setupConfig) return res.status(409).json({ error: 'This user profile is not configured.' })
+  if (setupBusy) return res.status(409).json({ error: 'A setup change is already in progress.' })
+  if (typeof req.body?.confirmation !== 'string' || req.body.confirmation !== 'RESET') {
+    return res.status(400).json({ error: 'Type RESET to confirm clearing the saved channel setup.' })
+  }
+  setupBusy = true
+  try {
+    if (setupConfig.passwordHash && setupConfig.passwordSalt) {
+      const password = typeof req.body?.password === 'string' ? req.body.password : ''
+      const candidate = Buffer.from(await scrypt(password, setupConfig.passwordSalt, 64, { N: 16_384, r: 8, p: 1 }))
+      const savedHash = Buffer.from(setupConfig.passwordHash, 'base64')
+      if (candidate.length !== savedHash.length || !timingSafeEqual(candidate, savedHash)) {
+        return res.status(401).json({ error: 'The password is incorrect.' })
+      }
+    } else {
+      if (!verifiedSetup || verifiedSetup.expiresAt <= Date.now() || verifiedPurpose !== 'reset'
+        || verifiedSetup.subject !== setupConfig.googleSubject
+        || !verifiedSetup.channels.some((channel) => channel.id === setupConfig!.channelId)) {
+        return res.status(403).json({ error: 'Reconnect the Google account that owns this channel before resetting setup.' })
+      }
+    }
+    await fs.unlink(setupFile)
+    setupConfig = null
+    invalidSavedSetup = false
+    channelId = defaultChannelId
+    verifiedSetup = null
+    verifiedPurpose = null
+    oauthAttempt = null
+    res.json({ ok: true })
+  } catch (error) {
+    res.status(500).json({ error: setupErrorMessage(error) })
+  } finally {
+    setupBusy = false
+  }
+})
 
 type ApiError = { error?: { message?: string; errors?: Array<{ reason?: string }> } }
 type ChannelResponse = { items?: Array<{ id: string; snippet: { title: string; description?: string; thumbnails?: Record<string, { url: string }> }; statistics: { subscriberCount?: string; videoCount?: string; viewCount?: string }; contentDetails: { relatedPlaylists: { uploads: string } } }> }
@@ -82,8 +477,17 @@ app.get('/api/channel-thumbnail', async (req, res) => {
 })
 
 app.get('/api/channel', async (_req, res) => {
+  if (loggedOut) {
+    res.status(401).json({ error: 'Sign in with Google to continue to the dashboard.' })
+    return
+  }
+  if (!channelId) {
+    res.status(409).json({ error: 'Complete the one-time channel setup before loading analytics.' })
+    return
+  }
   if (!apiKey) {
-    res.status(503).json({ error: 'YouTube API is not configured. Add YOUTUBE_API_KEY to your .env file; see README.md for setup.' })
+    const envPath = process.env.APP_CONFIG_DIR ? path.join(process.env.APP_CONFIG_DIR, '.env') : '.env'
+    res.status(503).json({ error: `YouTube API is not configured. Add YOUTUBE_API_KEY to ${envPath}; see README.md for setup.` })
     return
   }
   try {
@@ -138,7 +542,7 @@ app.get('/api/channel', async (_req, res) => {
     })
 
     res.setHeader('Cache-Control', 'no-store')
-    res.json({
+  res.json({
       channel: {
         id: channel.id, title: channel.snippet.title, description: channel.snippet.description || '',
         thumbnail: thumbnail(channel.snippet.thumbnails),
@@ -160,10 +564,32 @@ app.get('/api/channel', async (_req, res) => {
   }
 })
 
-const clientDist = path.resolve(__dirname, '../dist')
+const clientDist = path.resolve(process.env.CLIENT_DIST_DIR || path.join(process.cwd(), 'dist'))
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(clientDist))
   app.get('*', (_req, res) => res.sendFile(path.join(clientDist, 'index.html')))
 }
 
-app.listen(port, () => console.log(`YouTube analytics server listening on http://localhost:${port}`))
+void readSetup().then((saved) => {
+  setupConfig = saved
+  channelId = saved?.channelId || defaultChannelId
+  return readLogoutState()
+}).then((isLoggedOut) => {
+  loggedOut = isLoggedOut
+  server = app.listen(port, host, () => {
+    const address = server?.address()
+    const listeningPort = address && typeof address === 'object' ? address.port : port
+    console.log(`YouTube analytics server listening on http://${host}:${listeningPort}`)
+    if (process.send) process.send({ type: 'server-ready', port: listeningPort })
+  })
+}).catch((error) => {
+  console.error('Unable to read the saved MyYoutubeRecord setup:', error)
+  process.exitCode = 1
+})
+
+process.on('message', (message: unknown) => {
+  if (message && typeof message === 'object' && 'type' in message && message.type === 'shutdown') {
+    if (server) server.close(() => process.exit(0))
+    else process.exit(0)
+  }
+})
