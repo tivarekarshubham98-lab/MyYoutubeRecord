@@ -47,6 +47,40 @@ function thumbnail(thumbnails?: Record<string, { url: string }>): string | null 
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
+// Serve channel avatars from this origin so browser cross-origin response blocking
+// does not hide an otherwise valid YouTube thumbnail.
+app.get('/api/channel-thumbnail', async (req, res) => {
+  const rawUrl = req.query.url
+  if (typeof rawUrl !== 'string') {
+    res.status(400).end()
+    return
+  }
+  let imageUrl: URL
+  try {
+    imageUrl = new URL(rawUrl)
+  } catch {
+    res.status(400).end()
+    return
+  }
+  if (imageUrl.protocol !== 'https:' || !['yt3.ggpht.com', 'yt3.googleusercontent.com'].includes(imageUrl.hostname)) {
+    res.status(400).end()
+    return
+  }
+  try {
+    const image = await fetch(imageUrl, { headers: { Accept: 'image/avif,image/webp,image/*,*/*;q=0.8' } })
+    const contentType = image.headers.get('content-type') || ''
+    if (!image.ok || !contentType.startsWith('image/')) {
+      res.status(502).end()
+      return
+    }
+    res.setHeader('Content-Type', contentType)
+    res.setHeader('Cache-Control', 'public, max-age=3600')
+    res.send(Buffer.from(await image.arrayBuffer()))
+  } catch {
+    res.status(502).end()
+  }
+})
+
 app.get('/api/channel', async (_req, res) => {
   if (!apiKey) {
     res.status(503).json({ error: 'YouTube API is not configured. Add YOUTUBE_API_KEY to your .env file; see README.md for setup.' })
